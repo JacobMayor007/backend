@@ -10,7 +10,7 @@ const app = express();
 app.use(cors());
 
 const PORT = process.env.PORT || 8080;
-const MODEL_PATH = path.join(__dirname, "model");
+const MODEL_PATH = path.join(__dirname, "model_2");
 const UPLOAD_DIR = path.join(__dirname, "uploads");
 
 if (!fs.existsSync(UPLOAD_DIR)) {
