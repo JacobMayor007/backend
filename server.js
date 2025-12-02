@@ -63,23 +63,28 @@ app.post("/predict", upload.single("image"), async (req, res) => {
 
     const buffer = fs.readFileSync(imagePath);
 
-    const tensor = tf.node
-      .decodeImage(buffer, 3)
-      .resizeNearestNeighbor([224, 224])
-      .div(255.0)
-      .expandDims();
+    // Wrap ALL tensor operations in tf.tidy() for automatic cleanup
+    const probabilitiesArray = await tf.tidy(() => {
+      const tensor = tf.node
+        .decodeImage(buffer, 3)
+        .resizeNearestNeighbor([224, 224])
+        .div(255.0)
+        .expandDims();
 
-    console.log("📐 Tensor shape:", tensor.shape);
+      console.log("📐 Tensor shape:", tensor.shape);
 
-    let prediction;
-    try {
-      prediction = model.predict(tensor);
-    } catch (err) {
-      throw new Error("Model prediction failed: " + err.message);
-    }
+      let prediction;
+      try {
+        prediction = model.predict(tensor);
+      } catch (err) {
+        throw new Error("Model prediction failed: " + err.message);
+      }
 
-    const probabilities = (await prediction.array())[0];
-    console.log("📊 Raw probabilities:", probabilities);
+      // Return the array data to use outside tidy
+      return prediction.arraySync()[0];
+    });
+
+    console.log("📊 Raw probabilities:", probabilitiesArray);
 
     const classNames = [
       "Oidium Heveae",
@@ -88,13 +93,14 @@ app.post("/predict", upload.single("image"), async (req, res) => {
       "Leaf Spot",
       "Other",
     ];
-    if (probabilities.length !== classNames.length) {
+
+    if (probabilitiesArray.length !== classNames.length) {
       throw new Error(
-        `Expected ${classNames.length} output classes but got ${probabilities.length}`
+        `Expected ${classNames.length} output classes but got ${probabilitiesArray.length}`
       );
     }
 
-    const predictions = probabilities.map((prob, index) => ({
+    const predictions = probabilitiesArray.map((prob, index) => ({
       className: classNames[index],
       probability: prob,
     }));
@@ -118,6 +124,8 @@ app.post("/predict", upload.single("image"), async (req, res) => {
       imageSize: 224,
       timeStamp: new Date().toISOString(),
     };
+
+    console.log("✅ Top prediction:", topPrediction);
 
     // Delete uploaded image
     try {
@@ -148,6 +156,14 @@ app.post("/predict", upload.single("image"), async (req, res) => {
 
 app.get("/predict", (req, res) => {
   res.send(`✅ Server is running and listening on port ${PORT}`);
+});
+
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    modelLoaded: !!model,
+    memoryUsage: process.memoryUsage(),
+  });
 });
 
 app.listen(PORT, () => {
