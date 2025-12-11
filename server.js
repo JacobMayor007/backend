@@ -1,36 +1,24 @@
 require("dotenv").config();
 const express = require("express");
-const multer = require("multer");
+const http = require("http");
+const WebSocket = require("ws");
 const tf = require("@tensorflow/tfjs-node");
 const fs = require("fs");
 const path = require("path");
 const cors = require("cors");
 
 const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
 app.use(cors());
+app.use(express.json({ limit: "50mb" }));
 
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 3000;
 const MODEL_PATH = path.join(__dirname, "model_2");
-const UPLOAD_DIR = path.join(__dirname, "uploads");
 
-if (!fs.existsSync(UPLOAD_DIR)) {
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-}
-
-const upload = multer({
-  dest: UPLOAD_DIR,
-  limits: { fileSize: 20 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    if (file.mimetype.startsWith("image/")) {
-      cb(null, true);
-    } else {
-      cb(new Error("Only image files are allowed!"), false);
-    }
-  },
-});
-
+// Load TensorFlow model
 let model;
-
 (async () => {
   try {
     model = await tf.loadLayersModel(`file://${MODEL_PATH}/model.json`);
@@ -42,122 +30,81 @@ let model;
   }
 })();
 
-// Predict endpoint
-app.post("/predict", upload.single("image"), async (req, res) => {
-  if (!model) {
-    return res
-      .status(503)
-      .json({ error: "Model not loaded yet. Please try again later." });
-  }
+const classNames = [
+  "Oidium Heveae",
+  "Healthy",
+  "Anthracnose",
+  "Leaf Spot",
+  "Other",
+];
 
-  if (!req.file) {
-    return res.status(400).json({ error: "No image uploaded" });
-  }
+// WebSocket connection
+wss.on("connection", (ws) => {
+  console.log("✅ Client connected. Total clients:", wss.clients.size);
 
-  const imagePath = req.file.path;
-
-  try {
-    console.log(
-      `📸 Processing image: ${req.file.originalname || req.file.filename}`
-    );
-
-    const buffer = fs.readFileSync(imagePath);
-
-    // Wrap ALL tensor operations in tf.tidy() for automatic cleanup
-    const probabilitiesArray = await tf.tidy(() => {
-      const tensor = tf.node
-        .decodeImage(buffer, 3)
-        .resizeNearestNeighbor([224, 224])
-        .div(255.0)
-        .expandDims();
-
-      console.log("📐 Tensor shape:", tensor.shape);
-
-      let prediction;
-      try {
-        prediction = model.predict(tensor);
-      } catch (err) {
-        throw new Error("Model prediction failed: " + err.message);
-      }
-
-      // Return the array data to use outside tidy
-      return prediction.arraySync()[0];
-    });
-
-    console.log("📊 Raw probabilities:", probabilitiesArray);
-
-    const classNames = [
-      "Oidium Heveae",
-      "Healthy",
-      "Anthracnose",
-      "Leaf Spot",
-      "Other",
-    ];
-
-    if (probabilitiesArray.length !== classNames.length) {
-      throw new Error(
-        `Expected ${classNames.length} output classes but got ${probabilitiesArray.length}`
-      );
-    }
-
-    const predictions = probabilitiesArray.map((prob, index) => ({
-      className: classNames[index],
-      probability: prob,
-    }));
-
-    const topPrediction = predictions.reduce(
-      (max, p) => (p.probability > max.probability ? p : max),
-      { className: "", probability: 0 }
-    );
-
-    if (topPrediction.probability < 0.6) {
-      console.warn("⚠️ Low confidence prediction:", topPrediction);
-    }
-
-    const response = {
-      tfjsVersion: "1.7.4",
-      tmVersion: "2.4.10",
-      modelName: "tm-my-image-model",
-      labels: classNames,
-      predictions,
-      topPrediction,
-      imageSize: 224,
-      timeStamp: new Date().toISOString(),
-    };
-
-    console.log("✅ Top prediction:", topPrediction);
-
-    // Delete uploaded image
+  ws.on("message", async (message) => {
     try {
-      await fs.promises.unlink(imagePath);
-    } catch (err) {
-      console.error("❌ Error deleting uploaded file:", err);
-    }
+      const data = JSON.parse(message);
 
-    return res.json(response);
-  } catch (err) {
-    console.error("❌ Prediction error:", err.message);
+      if (data.type === "frame" && data.frameData) {
+        if (!model) {
+          ws.send(
+            JSON.stringify({ type: "error", error: "Model not loaded yet" })
+          );
+          return;
+        }
 
-    // Cleanup on failure
-    if (fs.existsSync(imagePath)) {
-      try {
-        await fs.promises.unlink(imagePath);
-      } catch (err2) {
-        console.error("❌ Failed to delete file after error:", err2.message);
+        const base64Data = data.frameData.split(",")[1];
+        const buffer = Buffer.from(base64Data, "base64");
+
+        const probabilitiesArray = await tf.tidy(() => {
+          const tensor = tf.node
+            .decodeImage(buffer, 3)
+            .resizeNearestNeighbor([224, 224])
+            .div(255.0)
+            .expandDims();
+
+          const prediction = model.predict(tensor);
+          return prediction.arraySync()[0];
+        });
+
+        const predictions = probabilitiesArray.map((prob, index) => ({
+          className: classNames[index],
+          probability: prob,
+        }));
+
+        const topPrediction = predictions.reduce(
+          (max, p) => (p.probability > max.probability ? p : max),
+          { className: "", probability: 0 }
+        );
+
+        ws.send(
+          JSON.stringify({
+            type: "prediction",
+            predictions,
+            topPrediction,
+            timeStamp: new Date().toISOString(),
+          })
+        );
+      } else {
+        ws.send(JSON.stringify({ type: "error", error: "Invalid message" }));
       }
+    } catch (err) {
+      console.error("❌ Error processing frame:", err);
+      ws.send(JSON.stringify({ type: "error", error: err.message }));
     }
+  });
 
-    return res.status(500).json({
-      error: "Prediction failed",
-      details: err.message,
-    });
-  }
+  ws.on("close", () => {
+    console.log("❌ Client disconnected. Total clients:", wss.clients.size);
+  });
+
+  ws.on("error", (err) => {
+    console.error("WebSocket error:", err);
+  });
 });
 
-app.get("/predict", (req, res) => {
-  res.send(`✅ Server is running and listening on port ${PORT}`);
-});
-
+// Optional REST endpoints for health check
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
@@ -166,6 +113,6 @@ app.get("/health", (req, res) => {
   });
 });
 
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
 });
